@@ -6,8 +6,8 @@ use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::{
-    CompletionModel, Content, Message, SystemContent, ToolChoice, ToolDefinition, Usage,
-    apply_cache_control,
+    CompletionModel, Content, Message, OAuthCompletionModel, SystemContent, ToolChoice,
+    ToolDefinition, Usage, apply_cache_control,
 };
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::sse::{Event, GenericEventSource};
@@ -306,6 +306,213 @@ where
             }
 
             // Ensure event source is closed when stream ends
+            sse_stream.close();
+
+            yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+                usage: final_usage.unwrap_or_default()
+            }))
+        }.instrument(span));
+
+        Ok(streaming::StreamingCompletionResponse::stream(stream))
+    }
+}
+
+// ================================================================
+// OAuth Completion Model Streaming Implementation
+// ================================================================
+
+impl<T> OAuthCompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + 'static,
+{
+    pub(crate) async fn stream(
+        &self,
+        mut completion_request: CompletionRequest,
+    ) -> Result<streaming::StreamingCompletionResponse<StreamingCompletionResponse>, CompletionError>
+    {
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat_streaming",
+                gen_ai.operation.name = "chat_streaming",
+                gen_ai.provider.name = "anthropic_oauth",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = &completion_request.preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = self.model,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = tracing::field::Empty,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+        let max_tokens = if let Some(tokens) = completion_request.max_tokens {
+            tokens
+        } else if let Some(tokens) = self.default_max_tokens {
+            tokens
+        } else {
+            return Err(CompletionError::RequestError(
+                "`max_tokens` must be set for Anthropic".into(),
+            ));
+        };
+
+        // Claude Code OAuth: Prepend original system prompt to first user message,
+        // then replace system prompt with hardcoded Claude Code instruction
+        let original_preamble = completion_request.preamble.take();
+        if let Some(preamble) = original_preamble {
+            if !preamble.is_empty() {
+                // Prepend system prompt to the first message (which is always the user prompt)
+                let first_msg = completion_request.chat_history.first_mut();
+                if let crate::message::Message::User { content } = first_msg {
+                    // Prepend system prompt to the first text content
+                    let first_content = content.first_mut();
+                    if let crate::message::UserContent::Text(text) = first_content {
+                        text.text = format!("{}\n\n{}", preamble, text.text);
+                    }
+                }
+            }
+        }
+
+        let mut full_history = vec![];
+        if let Some(docs) = completion_request.normalized_documents() {
+            full_history.push(docs);
+        }
+        full_history.extend(completion_request.chat_history);
+
+        let mut messages = full_history
+            .into_iter()
+            .map(Message::try_from)
+            .collect::<Result<Vec<Message>, _>>()?;
+
+        // Use hardcoded Claude Code instruction as the system prompt
+        let mut system: Vec<SystemContent> = vec![SystemContent::Text {
+            text: super::completion::CLAUDE_CODE_INSTRUCTIONS.to_string(),
+            cache_control: None,
+        }];
+
+        if self.prompt_caching {
+            apply_cache_control(&mut system, &mut messages);
+        }
+
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+
+        if !system.is_empty() {
+            merge_inplace(&mut body, json!({ "system": system }));
+        }
+
+        if let Some(temperature) = completion_request.temperature {
+            merge_inplace(&mut body, json!({ "temperature": temperature }));
+        }
+
+        if !completion_request.tools.is_empty() {
+            merge_inplace(
+                &mut body,
+                json!({
+                    "tools": completion_request
+                        .tools
+                        .into_iter()
+                        .map(|tool| ToolDefinition {
+                            name: tool.name,
+                            description: Some(tool.description),
+                            input_schema: tool.parameters,
+                        })
+                        .collect::<Vec<_>>(),
+                    "tool_choice": ToolChoice::Auto,
+                }),
+            );
+        }
+
+        if let Some(ref params) = completion_request.additional_params {
+            merge_inplace(&mut body, params.clone())
+        }
+
+        if enabled!(Level::TRACE) {
+            tracing::trace!(
+                target: "rig::completions",
+                "Anthropic OAuth completion request: {}",
+                serde_json::to_string_pretty(&body)?
+            );
+        }
+
+        let body: Vec<u8> = serde_json::to_vec(&body)?;
+
+        let req = self
+            .client
+            .post("/v1/messages")?
+            .body(body)
+            .map_err(http_client::Error::Protocol)?;
+
+        let stream = GenericEventSource::new(self.client.clone(), req);
+
+        let stream: StreamingResult<StreamingCompletionResponse> = Box::pin(stream! {
+            let mut current_tool_call: Option<ToolCallState> = None;
+            let mut current_thinking: Option<ThinkingState> = None;
+            let mut sse_stream = Box::pin(stream);
+            let mut input_tokens = 0;
+            let mut final_usage = None;
+
+            let mut text_content = String::new();
+
+            while let Some(sse_result) = sse_stream.next().await {
+                match sse_result {
+                    Ok(Event::Open) => {}
+                    Ok(Event::Message(sse)) => {
+                        match serde_json::from_str::<StreamingEvent>(&sse.data) {
+                            Ok(event) => {
+                                match &event {
+                                    StreamingEvent::MessageStart { message } => {
+                                        input_tokens = message.usage.input_tokens;
+
+                                        let span = tracing::Span::current();
+                                        span.record("gen_ai.response.id", &message.id);
+                                        span.record("gen_ai.response.model_name", &message.model);
+                                    },
+                                    StreamingEvent::MessageDelta { delta, usage } => {
+                                        if delta.stop_reason.is_some() {
+                                            let usage = PartialUsage {
+                                                 output_tokens: usage.output_tokens,
+                                                 input_tokens: Some(input_tokens.try_into().expect("Failed to convert input_tokens to usize")),
+                                            };
+
+                                            let span = tracing::Span::current();
+                                            span.record_token_usage(&usage);
+                                            final_usage = Some(usage);
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+
+                                if let Some(result) = handle_event(&event, &mut current_tool_call, &mut current_thinking) {
+                                    if let Ok(RawStreamingChoice::Message(ref text)) = result {
+                                        text_content += text;
+                                    }
+                                    yield result;
+                                }
+                            },
+                            Err(e) => {
+                                if !sse.data.trim().is_empty() {
+                                    yield Err(CompletionError::ResponseError(
+                                        format!("Failed to parse JSON: {} (Data: {})", e, sse.data)
+                                    ));
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        yield Err(CompletionError::ProviderError(format!("SSE Error: {e}")));
+                        break;
+                    }
+                }
+            }
+
             sse_stream.close();
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {

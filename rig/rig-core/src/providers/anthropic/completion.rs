@@ -11,7 +11,7 @@ use crate::{
 };
 use std::{convert::Infallible, str::FromStr};
 
-use super::client::Client;
+use super::client::{Client, OAuthClient};
 use crate::completion::CompletionRequest;
 use crate::providers::anthropic::streaming::StreamingCompletionResponse;
 use bytes::Bytes;
@@ -1037,6 +1037,193 @@ struct ApiErrorResponse {
 enum ApiResponse<T> {
     Message(T),
     Error(ApiErrorResponse),
+}
+
+// ================================================================
+// OAuth Completion Model (for Claude Code tokens)
+// ================================================================
+
+/// Hardcoded system instruction for Claude Code OAuth tokens.
+/// This matches the behavior expected by Claude Code authentication.
+pub const CLAUDE_CODE_INSTRUCTIONS: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Completion model for OAuth-authenticated clients (Claude Code tokens).
+///
+/// **Important**: This model modifies the system prompt behavior to match Claude Code:
+/// - The system instruction is replaced with a fixed Claude Code instruction
+/// - The original system prompt (preamble) is prepended to the first user message
+#[derive(Clone)]
+pub struct OAuthCompletionModel<T = reqwest::Client> {
+    pub(crate) client: OAuthClient<T>,
+    pub model: String,
+    pub default_max_tokens: Option<u64>,
+    pub prompt_caching: bool,
+}
+
+impl<T> OAuthCompletionModel<T>
+where
+    T: HttpClientExt,
+{
+    pub fn new(client: OAuthClient<T>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let default_max_tokens = calculate_max_tokens(&model);
+
+        Self {
+            client,
+            model,
+            default_max_tokens,
+            prompt_caching: false,
+        }
+    }
+
+    pub fn with_prompt_caching(mut self) -> Self {
+        self.prompt_caching = true;
+        self
+    }
+}
+
+impl<T> completion::CompletionModel for OAuthCompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + WasmCompatSend + WasmCompatSync + 'static,
+{
+    type Response = CompletionResponse;
+    type StreamingResponse = StreamingCompletionResponse;
+    type Client = OAuthClient<T>;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self::new(client.clone(), model.into())
+    }
+
+    async fn completion(
+        &self,
+        mut completion_request: completion::CompletionRequest,
+    ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "anthropic_oauth",
+                gen_ai.request.model = &self.model,
+                gen_ai.system_instructions = &completion_request.preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
+        if completion_request.max_tokens.is_none() {
+            if let Some(tokens) = self.default_max_tokens {
+                completion_request.max_tokens = Some(tokens);
+            } else {
+                return Err(CompletionError::RequestError(
+                    "`max_tokens` must be set for Anthropic".into(),
+                ));
+            }
+        }
+
+        // Claude Code OAuth: Prepend original system prompt to first user message,
+        // then replace system prompt with hardcoded Claude Code instruction
+        let original_preamble = completion_request.preamble.take();
+        if let Some(preamble) = original_preamble {
+            if !preamble.is_empty() {
+                // Prepend system prompt to the first message (which is always the user prompt)
+                let first_msg = completion_request.chat_history.first_mut();
+                if let crate::message::Message::User { content } = first_msg {
+                    // Prepend system prompt to the first text content
+                    let first_content = content.first_mut();
+                    if let crate::message::UserContent::Text(text) = first_content {
+                        text.text = format!("{}\n\n{}", preamble, text.text);
+                    }
+                }
+            }
+        }
+        // Set the hardcoded Claude Code instruction as the system prompt
+        completion_request.preamble = Some(CLAUDE_CODE_INSTRUCTIONS.to_string());
+
+        let request = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: &self.model,
+            request: completion_request,
+            prompt_caching: self.prompt_caching,
+        })?;
+
+        if enabled!(Level::TRACE) {
+            tracing::trace!(
+                target: "rig::completions",
+                "Anthropic OAuth completion request: {}",
+                serde_json::to_string_pretty(&request)?
+            );
+        }
+
+        async move {
+            let request: Vec<u8> = serde_json::to_vec(&request)?;
+
+            let req = self
+                .client
+                .post("/v1/messages")?
+                .body(request)
+                .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+            let response = self
+                .client
+                .send::<_, Bytes>(req)
+                .await
+                .map_err(CompletionError::HttpError)?;
+
+            if response.status().is_success() {
+                match serde_json::from_slice::<ApiResponse<CompletionResponse>>(
+                    response
+                        .into_body()
+                        .await
+                        .map_err(CompletionError::HttpError)?
+                        .to_vec()
+                        .as_slice(),
+                )? {
+                    ApiResponse::Message(completion) => {
+                        let span = tracing::Span::current();
+                        span.record_response_metadata(&completion);
+                        span.record_token_usage(&completion.usage);
+                        if enabled!(Level::TRACE) {
+                            tracing::trace!(
+                                target: "rig::completions",
+                                "Anthropic OAuth completion response: {}",
+                                serde_json::to_string_pretty(&completion)?
+                            );
+                        }
+                        completion.try_into()
+                    }
+                    ApiResponse::Error(ApiErrorResponse { message }) => {
+                        Err(CompletionError::ResponseError(message))
+                    }
+                }
+            } else {
+                let text: String = String::from_utf8_lossy(
+                    &response
+                        .into_body()
+                        .await
+                        .map_err(CompletionError::HttpError)?,
+                )
+                .into();
+                Err(CompletionError::ProviderError(text))
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<
+        crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
+        // Call the inherent stream method defined in streaming.rs
+        OAuthCompletionModel::stream(self, request).await
+    }
 }
 
 #[cfg(test)]
