@@ -7,6 +7,12 @@ use reqwest::Body;
 pub mod multipart;
 pub mod retry;
 pub mod sse;
+pub mod stream_stats;
+
+pub use stream_stats::{
+    ByteCountingStream, StreamBytesCounter,
+    set_active_counter, clear_active_counter, get_active_counter,
+};
 
 pub use multipart::MultipartForm;
 
@@ -123,6 +129,17 @@ pub trait HttpClientExt: WasmCompatSend + WasmCompatSync {
     fn send_streaming<T>(
         &self,
         req: Request<T>,
+    ) -> impl Future<Output = Result<StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes>;
+
+    /// Send a HTTP request with byte counting enabled.
+    /// Returns a streamed response where bytes are counted as they arrive.
+    /// The counter can be polled to get real-time throughput metrics.
+    fn send_streaming_with_stats<T>(
+        &self,
+        req: Request<T>,
+        counter: StreamBytesCounter,
     ) -> impl Future<Output = Result<StreamingResponse>> + WasmCompatSend
     where
         T: Into<Bytes>;
@@ -259,12 +276,76 @@ impl HttpClientExt for reqwest::Client {
 
             use futures::StreamExt;
 
+            // Check for active counter and wrap stream if present
+            let base_stream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|e| Error::Instance(Box::new(e))));
+
             let mapped_stream: Pin<Box<dyn WasmCompatSendStream<InnerItem = Result<Bytes>>>> =
-                Box::pin(
-                    response
-                        .bytes_stream()
-                        .map(|chunk| chunk.map_err(|e| Error::Instance(Box::new(e)))),
-                );
+                if let Some(counter) = get_active_counter() {
+                    tracing::info!("rig::reqwest::send_streaming: wrapping stream with byte counter");
+                    Box::pin(ByteCountingStream::new(base_stream, counter))
+                } else {
+                    tracing::debug!("rig::reqwest::send_streaming: no active counter");
+                    Box::pin(base_stream)
+                };
+
+            res.body(mapped_stream).map_err(Error::Protocol)
+        }
+    }
+
+    fn send_streaming_with_stats<T>(
+        &self,
+        req: Request<T>,
+        counter: StreamBytesCounter,
+    ) -> impl Future<Output = Result<StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes>,
+    {
+        let (parts, body) = req.into_parts();
+
+        let req = self
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers)
+            .body(body.into())
+            .build()
+            .map_err(|x| Error::Instance(x.into()))
+            .unwrap();
+
+        let client = self.clone();
+
+        async move {
+            let response: reqwest::Response = client.execute(req).await.map_err(instance_error)?;
+            if !response.status().is_success() {
+                return Err(Error::InvalidStatusCodeWithMessage(
+                    response.status(),
+                    response.text().await.unwrap(),
+                ));
+            }
+
+            #[cfg(not(target_family = "wasm"))]
+            let mut res = Response::builder()
+                .status(response.status())
+                .version(response.version());
+
+            #[cfg(target_family = "wasm")]
+            let mut res = Response::builder().status(response.status());
+
+            if let Some(hs) = res.headers_mut() {
+                *hs = response.headers().clone();
+            }
+
+            use futures::StreamExt;
+
+            // Wrap the byte stream with counting
+            let base_stream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|e| Error::Instance(Box::new(e))));
+
+            let counting_stream = ByteCountingStream::new(base_stream, counter);
+
+            let mapped_stream: Pin<Box<dyn WasmCompatSendStream<InnerItem = Result<Bytes>>>> =
+                Box::pin(counting_stream);
 
             res.body(mapped_stream).map_err(Error::Protocol)
         }
@@ -404,12 +485,74 @@ impl HttpClientExt for reqwest_middleware::ClientWithMiddleware {
 
             use futures::StreamExt;
 
+            // Check for active counter and wrap stream if present
+            let base_stream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|e| Error::Instance(Box::new(e))));
+
             let mapped_stream: Pin<Box<dyn WasmCompatSendStream<InnerItem = Result<Bytes>>>> =
-                Box::pin(
-                    response
-                        .bytes_stream()
-                        .map(|chunk| chunk.map_err(|e| Error::Instance(Box::new(e)))),
-                );
+                if let Some(counter) = get_active_counter() {
+                    Box::pin(ByteCountingStream::new(base_stream, counter))
+                } else {
+                    Box::pin(base_stream)
+                };
+
+            res.body(mapped_stream).map_err(Error::Protocol)
+        }
+    }
+
+    fn send_streaming_with_stats<T>(
+        &self,
+        req: Request<T>,
+        counter: StreamBytesCounter,
+    ) -> impl Future<Output = Result<StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes>,
+    {
+        let (parts, body) = req.into_parts();
+
+        let req = self
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers)
+            .body(body.into())
+            .build()
+            .map_err(|x| Error::Instance(x.into()))
+            .unwrap();
+
+        let client = self.clone();
+
+        async move {
+            let response: reqwest::Response = client.execute(req).await.map_err(instance_error)?;
+            if !response.status().is_success() {
+                return Err(Error::InvalidStatusCodeWithMessage(
+                    response.status(),
+                    response.text().await.unwrap(),
+                ));
+            }
+
+            #[cfg(not(target_family = "wasm"))]
+            let mut res = Response::builder()
+                .status(response.status())
+                .version(response.version());
+
+            #[cfg(target_family = "wasm")]
+            let mut res = Response::builder().status(response.status());
+
+            if let Some(hs) = res.headers_mut() {
+                *hs = response.headers().clone();
+            }
+
+            use futures::StreamExt;
+
+            // Wrap the byte stream with counting
+            let base_stream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|e| Error::Instance(Box::new(e))));
+
+            let counting_stream = ByteCountingStream::new(base_stream, counter);
+
+            let mapped_stream: Pin<Box<dyn WasmCompatSendStream<InnerItem = Result<Bytes>>>> =
+                Box::pin(counting_stream);
 
             res.body(mapped_stream).map_err(Error::Protocol)
         }

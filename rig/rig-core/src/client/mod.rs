@@ -319,6 +319,17 @@ where
     {
         self.http_client.send_streaming(req)
     }
+
+    fn send_streaming_with_stats<T>(
+        &self,
+        req: Request<T>,
+        counter: http_client::StreamBytesCounter,
+    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes>,
+    {
+        self.http_client.send_streaming_with_stats(req, counter)
+    }
 }
 
 impl<Ext, Builder, H> Client<Ext, H>

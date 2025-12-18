@@ -26,6 +26,7 @@ use crate::{
     http_client::{
         HttpClientExt, Result as StreamResult, instance_error,
         retry::{DEFAULT_RETRY, RetryPolicy},
+        StreamBytesCounter,
     },
     wasm_compat::{WasmCompatSend, WasmCompatSendStream},
 };
@@ -75,6 +76,8 @@ pin_project! {
         retry_policy: BoxedRetry,
         last_event_id: String,
         last_retry: Option<(usize, Duration)>,
+        // Optional byte counter for tracking raw bytes received
+        bytes_counter: Option<StreamBytesCounter>,
     }
 }
 
@@ -89,13 +92,30 @@ where
     RequestBody: Into<Bytes> + Clone + Send + 'static,
 {
     pub fn new(client: HttpClient, req: Request<RequestBody>) -> Self {
+        Self::new_internal(client, req, None)
+    }
+
+    /// Create a new GenericEventSource with byte counting enabled.
+    /// The counter can be polled to get real-time throughput metrics.
+    pub fn new_with_stats(client: HttpClient, req: Request<RequestBody>, counter: StreamBytesCounter) -> Self {
+        Self::new_internal(client, req, Some(counter))
+    }
+
+    fn new_internal(client: HttpClient, req: Request<RequestBody>, bytes_counter: Option<StreamBytesCounter>) -> Self {
         let client_clone = client.clone();
+        let counter_clone = bytes_counter.clone();
         let mut req_clone = req.clone();
         req_clone
             .headers_mut()
             .entry("Accept")
             .or_insert(HeaderValue::from_static("text/event-stream"));
-        let res_fut = Box::pin(async move { client_clone.clone().send_streaming(req_clone).await });
+        let res_fut = Box::pin(async move {
+            if let Some(counter) = counter_clone {
+                client_clone.clone().send_streaming_with_stats(req_clone, counter).await
+            } else {
+                client_clone.clone().send_streaming(req_clone).await
+            }
+        });
         Self {
             client,
             next_response: Some(res_fut),
@@ -106,6 +126,7 @@ where
             retry_policy: Box::new(DEFAULT_RETRY),
             last_event_id: String::new(),
             last_retry: None,
+            bytes_counter,
         }
     }
 
@@ -150,7 +171,14 @@ where
             HeaderValue::from_str(self.last_event_id).map_err(instance_error)?,
         );
         let client = self.client.clone();
-        let res_future = Box::pin(async move { client.send_streaming(req).await });
+        let counter = self.bytes_counter.clone();
+        let res_future = Box::pin(async move {
+            if let Some(counter) = counter {
+                client.send_streaming_with_stats(req, counter).await
+            } else {
+                client.send_streaming(req).await
+            }
+        });
         self.next_response.replace(res_future);
         Ok(())
     }

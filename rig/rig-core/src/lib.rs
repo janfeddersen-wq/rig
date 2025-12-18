@@ -140,6 +140,10 @@ pub mod wasm_compat;
 // Re-export commonly used types and traits
 pub use completion::message;
 pub use embeddings::Embed;
+pub use http_client::{
+    StreamBytesCounter, ByteCountingStream,
+    set_active_counter, clear_active_counter, get_active_counter,
+};
 pub use one_or_many::{EmptyListError, OneOrMany};
 
 #[cfg(feature = "derive")]
