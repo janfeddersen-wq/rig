@@ -199,6 +199,7 @@ where
             tool_choice: self.tool_choice,
             context_compressor: self.context_compressor,
             max_context_tokens: self.max_context_tokens,
+            context_window: self.context_window,
         }
     }
 
@@ -239,6 +240,7 @@ where
             tool_choice: self.tool_choice,
             context_compressor: self.context_compressor,
             max_context_tokens: self.max_context_tokens,
+            context_window: self.context_window,
         }
     }
 
