@@ -77,6 +77,8 @@ where
     pub context_compressor: Option<Arc<dyn crate::compression::ContextCompressor>>,
     /// Maximum context tokens before compression is applied.
     pub max_context_tokens: Option<usize>,
+    /// Model's context window size in tokens (for pre-request estimation).
+    pub context_window: Option<u64>,
 }
 
 impl<M> Agent<M>

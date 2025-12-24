@@ -314,6 +314,14 @@ impl ToolServerHandle {
 
         Ok(tooldefs)
     }
+
+    /// Get tool definitions serialized as JSON string for context estimation.
+    pub async fn get_tool_definitions_json(&self) -> String {
+        match self.get_tool_defs(None).await {
+            Ok(defs) => serde_json::to_string(&defs).unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
 }
 
 pub struct ToolServerRequest {

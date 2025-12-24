@@ -69,6 +69,8 @@ where
     context_compressor: Option<std::sync::Arc<dyn crate::compression::ContextCompressor>>,
     /// Maximum context tokens before compression
     max_context_tokens: Option<usize>,
+    /// Model's context window size in tokens (for pre-request estimation)
+    context_window: Option<u64>,
 }
 
 impl<M> AgentBuilder<M>
@@ -90,6 +92,7 @@ where
             tool_choice: None,
             context_compressor: None,
             max_context_tokens: None,
+            context_window: None,
         }
     }
 
@@ -159,6 +162,7 @@ where
             tool_choice: self.tool_choice,
             context_compressor: self.context_compressor,
             max_context_tokens: self.max_context_tokens,
+            context_window: self.context_window,
         }
     }
 
@@ -313,6 +317,7 @@ where
             tool_choice: self.tool_choice,
             context_compressor: self.context_compressor,
             max_context_tokens: self.max_context_tokens,
+            context_window: self.context_window,
         }
     }
 
@@ -331,6 +336,12 @@ where
     /// Set additional parameters to be passed to the model
     pub fn additional_params(mut self, params: serde_json::Value) -> Self {
         self.additional_params = Some(params);
+        self
+    }
+
+    /// Set the context window size for pre-request estimation
+    pub fn context_window(mut self, context_window: u64) -> Self {
+        self.context_window = Some(context_window);
         self
     }
 
@@ -356,6 +367,7 @@ where
             tool_server_handle,
             context_compressor: self.context_compressor,
             max_context_tokens: self.max_context_tokens,
+            context_window: self.context_window,
         }
     }
 }
@@ -415,6 +427,8 @@ where
     context_compressor: Option<std::sync::Arc<dyn crate::compression::ContextCompressor>>,
     /// Maximum context tokens before compression
     max_context_tokens: Option<usize>,
+    /// Model's context window size in tokens (for pre-request estimation)
+    context_window: Option<u64>,
 }
 
 impl<M> AgentBuilderSimple<M>
@@ -438,6 +452,7 @@ where
             tool_choice: None,
             context_compressor: None,
             max_context_tokens: None,
+            context_window: None,
         }
     }
 
@@ -590,6 +605,12 @@ where
         self
     }
 
+    /// Set the context window size for pre-request estimation
+    pub fn context_window(mut self, context_window: u64) -> Self {
+        self.context_window = Some(context_window);
+        self
+    }
+
     /// Build the agent
     pub fn build(self) -> Agent<M> {
         let tool_server_handle = ToolServer::new()
@@ -612,6 +633,7 @@ where
             tool_server_handle,
             context_compressor: self.context_compressor,
             max_context_tokens: self.max_context_tokens,
+            context_window: self.context_window,
         }
     }
 }

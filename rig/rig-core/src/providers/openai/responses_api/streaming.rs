@@ -212,19 +212,36 @@ where
         let mut request = self.create_completion_request(completion_request)?;
         request.stream = Some(true);
 
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "OpenAI Responses streaming completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
-
-        let body = serde_json::to_vec(&request)?;
+        // Use codex-compatible format if codex_mode is enabled
+        let is_codex = request.is_codex_mode();
+        tracing::debug!("streaming: is_codex_mode() = {}", is_codex);
+        let body = if is_codex {
+            tracing::debug!("streaming: using codex JSON format");
+            let codex_json = request.to_codex_json();
+            tracing::debug!("streaming: codex JSON: {}", serde_json::to_string_pretty(&codex_json).unwrap_or_default());
+            if enabled!(Level::TRACE) {
+                tracing::trace!(
+                    target: "rig::completions",
+                    "OpenAI Responses streaming completion request (codex mode): {}",
+                    serde_json::to_string_pretty(&request.to_codex_json())?
+                );
+            }
+            serde_json::to_vec(&request.to_codex_json())?
+        } else {
+            if enabled!(Level::TRACE) {
+                tracing::trace!(
+                    target: "rig::completions",
+                    "OpenAI Responses streaming completion request: {}",
+                    serde_json::to_string_pretty(&request)?
+                );
+            }
+            serde_json::to_vec(&request)?
+        };
 
         let req = self
             .client
             .post("/responses")?
+            .header("Content-Type", "application/json")
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 

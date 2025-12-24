@@ -86,7 +86,8 @@ fn estimate_assistant_content_tokens(content: &AssistantContent) -> usize {
 /// - All message tokens (user, assistant, tool calls, tool results, reasoning)
 ///
 /// The estimation uses the 3.4 chars/token ratio optimized for code-heavy content.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextEstimate {
     /// Tokens used by the system prompt/preamble
     pub system_prompt_tokens: usize,

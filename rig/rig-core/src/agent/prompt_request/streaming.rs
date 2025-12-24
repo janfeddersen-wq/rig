@@ -2,6 +2,7 @@ use crate::{
     OneOrMany,
     agent::CancelSignal,
     completion::GetTokenUsage,
+    compression::ContextEstimate,
     json_utils,
     message::{AssistantContent, Reasoning, ToolResult, ToolResultContent, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingCompletion},
@@ -33,6 +34,10 @@ pub type StreamingResult<R> =
 #[serde(tag = "type", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum MultiTurnStreamItem<R> {
+    /// Context estimate emitted BEFORE each LLM request.
+    /// This allows the UI to update with the estimated context usage
+    /// before the request is sent.
+    PreRequestContextEstimate(ContextEstimate),
     /// A streamed assistant content item.
     StreamAssistantItem(StreamedAssistantContent<R>),
     /// A streamed user content item (mostly for tool results).
@@ -75,6 +80,10 @@ impl<R> MultiTurnStreamItem<R> {
             response: response.to_string(),
             aggregated_usage,
         })
+    }
+
+    pub fn context_estimate(estimate: ContextEstimate) -> Self {
+        Self::PreRequestContextEstimate(estimate)
     }
 }
 
@@ -233,6 +242,29 @@ where
                     if cancel_signal.is_cancelled() {
                         yield Err(StreamingError::Prompt(PromptError::prompt_cancelled(chat_history.read().await.to_vec()).into()));
                     }
+                }
+
+                // Calculate and emit context estimate BEFORE sending the LLM request.
+                // This allows the UI to show the estimated context usage before the request is sent.
+                {
+                    let history_snapshot = chat_history.read().await;
+                    let mut all_messages: Vec<Message> = history_snapshot.clone();
+                    all_messages.push(current_prompt.clone());
+
+                    let preamble = agent.preamble.as_deref().unwrap_or("");
+                    // Get tool definitions from agent (serialized as JSON for estimation)
+                    let tool_defs_json = agent.tool_server_handle.get_tool_definitions_json().await;
+                    // Default context window; can be overridden via agent config in future
+                    let context_window = agent.context_window.unwrap_or(200_000);
+
+                    let estimate = crate::compression::ContextEstimate::new(
+                        preamble,
+                        &tool_defs_json,
+                        &all_messages,
+                        context_window,
+                    );
+
+                    yield Ok(MultiTurnStreamItem::context_estimate(estimate));
                 }
 
                 let chat_stream_span = info_span!(

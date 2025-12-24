@@ -79,6 +79,101 @@ impl CompletionRequest {
 
         self
     }
+
+    /// Check if codex mode is enabled
+    pub fn is_codex_mode(&self) -> bool {
+        self.additional_parameters.codex_mode.unwrap_or(false)
+    }
+
+    /// Convert to codex-compatible JSON format.
+    /// ChatGPT backend uses a simpler format than standard OpenAI Responses API.
+    pub fn to_codex_json(&self) -> serde_json::Value {
+        use serde_json::json;
+
+        // Convert input items to simple format
+        let simple_input: Vec<serde_json::Value> = self.input.iter().map(|item| {
+            match &item.input {
+                InputContent::Message(msg) => {
+                    let role = match &item.role {
+                        Some(Role::User) => "user",
+                        Some(Role::Assistant) => "assistant",
+                        Some(Role::System) => "system",
+                        None => "assistant",
+                    };
+                    // Extract plain text content
+                    let content = match msg {
+                        Message::User { content, .. } => {
+                            content.iter().filter_map(|c| {
+                                match c {
+                                    UserContent::InputText { text } => Some(text.clone()),
+                                    _ => None,
+                                }
+                            }).collect::<Vec<_>>().join("\n")
+                        },
+                        Message::Assistant { content, .. } => {
+                            content.iter().filter_map(|c| {
+                                match c {
+                                    AssistantContentType::Text(AssistantContent::OutputText(Text { text })) => Some(text.clone()),
+                                    AssistantContentType::Text(AssistantContent::Refusal { refusal }) => Some(refusal.clone()),
+                                    _ => None,
+                                }
+                            }).collect::<Vec<_>>().join("\n")
+                        },
+                        Message::System { content, .. } => {
+                            content.iter().map(|c| c.text.clone()).collect::<Vec<_>>().join("\n")
+                        },
+                        _ => String::new(),
+                    };
+                    json!({ "role": role, "content": content })
+                },
+                InputContent::FunctionCall(fc) => {
+                    json!({
+                        "type": "function_call",
+                        "call_id": fc.call_id,
+                        "name": fc.name,
+                        "arguments": fc.arguments.to_string()
+                    })
+                },
+                InputContent::FunctionCallOutput(tr) => {
+                    json!({
+                        "type": "function_call_output",
+                        "call_id": tr.call_id,
+                        "output": tr.output
+                    })
+                },
+                InputContent::Reasoning(_) => json!({}),
+            }
+        }).collect();
+
+        // Build codex-compatible request (no max_output_tokens)
+        let mut request = json!({
+            "model": self.model,
+            "input": simple_input,
+            "stream": self.stream,
+        });
+
+        if let Some(instructions) = &self.instructions {
+            request["instructions"] = json!(instructions);
+        }
+
+        if let Some(temp) = self.temperature {
+            request["temperature"] = json!(temp);
+        }
+
+        if !self.tools.is_empty() {
+            request["tools"] = serde_json::to_value(&self.tools).unwrap_or(json!([]));
+        }
+
+        if let Some(store) = self.additional_parameters.store {
+            request["store"] = json!(store);
+        }
+
+        if let Some(parallel) = self.additional_parameters.parallel_tool_calls {
+            request["parallel_tool_calls"] = json!(parallel);
+        }
+
+        request
+    }
 }
 
 /// An input item for [`CompletionRequest`].
@@ -628,8 +723,16 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
             .unwrap_or(Value::Null)
             .as_bool();
 
-        let additional_parameters = if let Some(map) = req.additional_params {
-            serde_json::from_value::<AdditionalParameters>(map).expect("Converting additional parameters to AdditionalParameters should never fail as every field is an Option")
+        let additional_parameters = if let Some(ref map) = req.additional_params {
+            tracing::debug!("additional_params JSON: {:?}", map);
+            let mut params = serde_json::from_value::<AdditionalParameters>(map.clone()).expect("Converting additional parameters to AdditionalParameters should never fail as every field is an Option");
+            // Manually check for codex_mode since it has skip_serializing
+            if let Some(codex) = map.get("codex_mode").and_then(|v| v.as_bool()) {
+                tracing::debug!("Found codex_mode in JSON: {}", codex);
+                params.codex_mode = Some(codex);
+            }
+            tracing::debug!("codex_mode after parsing: {:?}", params.codex_mode);
+            params
         } else {
             // If there's no additional parameters, initialise an empty object
             AdditionalParameters::default()
@@ -772,6 +875,10 @@ pub struct AdditionalParameters {
     /// Whether or not to store the response for later retrieval by API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
+    /// Enable Codex/ChatGPT backend compatibility mode.
+    /// When true, uses simplified message format (plain string content instead of typed arrays).
+    #[serde(skip_serializing)]
+    pub codex_mode: Option<bool>,
 }
 
 impl AdditionalParameters {
