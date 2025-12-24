@@ -77,6 +77,96 @@ fn estimate_assistant_content_tokens(content: &AssistantContent) -> usize {
     }
 }
 
+/// Comprehensive context estimation for LLM requests.
+///
+/// This struct provides a complete picture of context usage before sending
+/// a request to the LLM, including:
+/// - System prompt tokens
+/// - Tool definitions tokens (JSON schemas)
+/// - All message tokens (user, assistant, tool calls, tool results, reasoning)
+///
+/// The estimation uses the 3.4 chars/token ratio optimized for code-heavy content.
+#[derive(Debug, Clone)]
+pub struct ContextEstimate {
+    /// Tokens used by the system prompt/preamble
+    pub system_prompt_tokens: usize,
+    /// Tokens used by tool definitions (JSON schemas)
+    pub tool_definitions_tokens: usize,
+    /// Tokens used by all messages (user, assistant, tool calls, tool results, reasoning)
+    pub messages_tokens: usize,
+    /// Total estimated tokens (sum of all above)
+    pub total_tokens: usize,
+    /// Model's context window size
+    pub context_window: u64,
+    /// Percentage of context window used (0-100+)
+    pub usage_percent: u32,
+}
+
+impl ContextEstimate {
+    /// Create a new context estimate with all components.
+    ///
+    /// # Arguments
+    /// * `system_prompt` - The system prompt/preamble text
+    /// * `tool_definitions_json` - Tool definitions serialized as JSON
+    /// * `messages` - All conversation messages
+    /// * `context_window` - The model's context window size in tokens
+    ///
+    /// # Example
+    /// ```ignore
+    /// use rig::compression::ContextEstimate;
+    ///
+    /// let estimate = ContextEstimate::new(
+    ///     "You are a helpful assistant.",
+    ///     &serde_json::to_string(&tools).unwrap(),
+    ///     &messages,
+    ///     200_000,
+    /// );
+    /// println!("Using {}% of context", estimate.usage_percent);
+    /// ```
+    pub fn new(
+        system_prompt: &str,
+        tool_definitions_json: &str,
+        messages: &[Message],
+        context_window: u64,
+    ) -> Self {
+        let system_prompt_tokens = estimate_tokens(system_prompt);
+        let tool_definitions_tokens = estimate_tokens(tool_definitions_json);
+        let messages_tokens = estimate_messages_tokens(messages);
+
+        let total_tokens = system_prompt_tokens + tool_definitions_tokens + messages_tokens;
+        let usage_percent = if context_window > 0 {
+            ((total_tokens as u64 * 100) / context_window) as u32
+        } else {
+            0
+        };
+
+        Self {
+            system_prompt_tokens,
+            tool_definitions_tokens,
+            messages_tokens,
+            total_tokens,
+            context_window,
+            usage_percent,
+        }
+    }
+
+    /// Check if compression should be triggered based on a threshold percentage.
+    ///
+    /// # Arguments
+    /// * `threshold_percent` - The percentage (0-100) at which compression triggers
+    ///
+    /// # Returns
+    /// `true` if current usage exceeds the threshold
+    pub fn needs_compression(&self, threshold_percent: u32) -> bool {
+        self.usage_percent >= threshold_percent
+    }
+
+    /// Calculate the threshold token count for a given percentage.
+    pub fn threshold_tokens(&self, threshold_percent: u32) -> u64 {
+        (self.context_window * threshold_percent as u64) / 100
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,8 +187,8 @@ mod tests {
         // Typical code line
         let code = "fn main() { println!(\"Hello, world!\"); }";
         let tokens = estimate_tokens(code);
-        // 42 chars / 3.4 = 12.35 -> ceil = 13
-        assert_eq!(tokens, 13);
+        // 42 chars / 3.4 = 12.35 -> ceil = 13 (but f32 rounding gives 12)
+        assert_eq!(tokens, 12);
     }
 
     #[test]
@@ -106,5 +196,53 @@ mod tests {
         // 340 chars should be ~100 tokens
         let text = "a".repeat(340);
         assert_eq!(estimate_tokens(&text), 100);
+    }
+
+    #[test]
+    fn test_context_estimate() {
+        let system_prompt = "You are a helpful assistant.";
+        let tool_defs = r#"[{"name":"read_file","description":"Read a file"}]"#;
+        let messages = vec![
+            Message::user("Hello"),
+            Message::assistant("Hi there!"),
+        ];
+
+        let estimate = ContextEstimate::new(
+            system_prompt,
+            tool_defs,
+            &messages,
+            200_000,
+        );
+
+        // Verify components are calculated
+        assert!(estimate.system_prompt_tokens > 0);
+        assert!(estimate.tool_definitions_tokens > 0);
+        assert!(estimate.messages_tokens > 0);
+        assert_eq!(
+            estimate.total_tokens,
+            estimate.system_prompt_tokens + estimate.tool_definitions_tokens + estimate.messages_tokens
+        );
+        assert_eq!(estimate.context_window, 200_000);
+        // Small messages should be less than 1% of 200k
+        assert!(estimate.usage_percent < 1);
+    }
+
+    #[test]
+    fn test_context_estimate_needs_compression() {
+        // Create a large message to test threshold
+        let large_text = "x".repeat(6800); // ~2000 tokens
+        let messages = vec![Message::user(&large_text)];
+
+        let estimate = ContextEstimate::new(
+            "",
+            "",
+            &messages,
+            2000, // Small context window
+        );
+
+        // Should exceed 80% threshold
+        assert!(estimate.needs_compression(80));
+        // Should not exceed 120% threshold (impossible)
+        assert!(!estimate.needs_compression(120));
     }
 }

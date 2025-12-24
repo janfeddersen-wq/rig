@@ -31,7 +31,7 @@ mod truncation;
 mod sliding_window;
 mod summarizing;
 
-pub use estimator::{estimate_tokens, estimate_message_tokens, estimate_messages_tokens};
+pub use estimator::{estimate_tokens, estimate_message_tokens, estimate_messages_tokens, ContextEstimate};
 pub use traits::{ContextCompressor, CompressionError};
 pub use truncation::TruncationCompressor;
 pub use sliding_window::SlidingWindowCompressor;
