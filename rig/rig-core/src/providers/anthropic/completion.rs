@@ -791,8 +791,22 @@ struct AnthropicCompletionRequest {
     additional_params: Option<serde_json::Value>,
 }
 
-/// Helper to set cache_control on a Content block
+/// Check if a Content block is empty (Anthropic doesn't allow cache_control on empty blocks)
+fn is_content_empty(content: &Content) -> bool {
+    match content {
+        Content::Text { text, .. } => text.is_empty(),
+        Content::ToolResult { content, .. } => content.is_empty(),
+        // Images, documents, tool uses, and thinking blocks are never "empty"
+        _ => false,
+    }
+}
+
+/// Helper to set cache_control on a Content block (only if non-empty)
 fn set_content_cache_control(content: &mut Content, value: Option<CacheControl>) {
+    // Don't set cache_control on empty content blocks - Anthropic rejects this
+    if value.is_some() && is_content_empty(content) {
+        return;
+    }
     match content {
         Content::Text { cache_control, .. } => *cache_control = value,
         Content::Image { cache_control, .. } => *cache_control = value,
@@ -803,13 +817,15 @@ fn set_content_cache_control(content: &mut Content, value: Option<CacheControl>)
 }
 
 /// Apply cache control breakpoints to system prompt and messages.
-/// Strategy: cache the system prompt, and mark the last content block of the last message
+/// Strategy: cache the system prompt, and mark the last non-empty content block of the last message
 /// for caching. This allows the conversation history to be cached while new messages
 /// are added.
 pub fn apply_cache_control(system: &mut [SystemContent], messages: &mut [Message]) {
     // Add cache_control to the system prompt (if non-empty)
-    if let Some(SystemContent::Text { cache_control, .. }) = system.last_mut() {
-        *cache_control = Some(CacheControl::Ephemeral);
+    if let Some(SystemContent::Text { text, cache_control }) = system.last_mut() {
+        if !text.is_empty() {
+            *cache_control = Some(CacheControl::Ephemeral);
+        }
     }
 
     // Clear any existing cache_control from all message content blocks
@@ -819,9 +835,13 @@ pub fn apply_cache_control(system: &mut [SystemContent], messages: &mut [Message
         }
     }
 
-    // Add cache_control to the last content block of the last message
+    // Add cache_control to the last non-empty content block of the last message
     if let Some(last_msg) = messages.last_mut() {
-        set_content_cache_control(last_msg.content.last_mut(), Some(CacheControl::Ephemeral));
+        // Only set cache_control if the last content is non-empty
+        let last_content = last_msg.content.last_mut();
+        if !is_content_empty(last_content) {
+            set_content_cache_control(last_content, Some(CacheControl::Ephemeral));
+        }
     }
 }
 
