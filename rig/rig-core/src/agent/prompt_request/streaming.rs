@@ -4,7 +4,7 @@ use crate::{
     completion::GetTokenUsage,
     compression::ContextEstimate,
     json_utils,
-    message::{AssistantContent, ImageMediaType, MimeType, Reasoning, ToolResult, ToolResultContent, UserContent},
+    message::{AssistantContent, Reasoning, ToolResult, ToolResultContent, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingCompletion},
     wasm_compat::{WasmBoxedFuture, WasmCompatSend},
 };
@@ -21,66 +21,6 @@ use crate::{
     message::{Message, Text},
     tool::ToolSetError,
 };
-
-/// Structure for parsing multimodal tool results with image content.
-/// Tools can return JSON in this format to include images in their results.
-#[derive(Debug, Clone, Deserialize)]
-struct MultimodalToolResult {
-    /// Type marker - must be "image" for image results
-    #[serde(rename = "type")]
-    result_type: String,
-    /// MIME type of the image (e.g., "image/png", "image/jpeg")
-    media_type: String,
-    /// Base64-encoded image data
-    data: String,
-    /// Original file path (optional, for context)
-    #[serde(default)]
-    path: Option<String>,
-    /// Image width in pixels (optional)
-    #[serde(default)]
-    width: Option<u32>,
-    /// Image height in pixels (optional)
-    #[serde(default)]
-    height: Option<u32>,
-}
-
-/// Parse a tool result string and convert it to appropriate content blocks.
-///
-/// If the result is a JSON object with `"type": "image"`, it will be parsed as
-/// multimodal content and return both image and text content blocks.
-/// Otherwise, it returns a single text content block.
-fn parse_tool_result_content(tool_result: &str) -> OneOrMany<ToolResultContent> {
-    // Try to parse as multimodal image result
-    if let Ok(img_result) = serde_json::from_str::<MultimodalToolResult>(tool_result) {
-        if img_result.result_type == "image" {
-            // Parse the media type
-            let media_type = ImageMediaType::from_mime_type(&img_result.media_type);
-
-            // Create description text
-            let description = if let Some(path) = &img_result.path {
-                match (img_result.width, img_result.height) {
-                    (Some(w), Some(h)) => format!("Image from {} ({}x{})", path, w, h),
-                    _ => format!("Image from {}", path),
-                }
-            } else {
-                "Image content".to_string()
-            };
-
-            // Return both text description and image content
-            // The text comes first to provide context, then the actual image
-            match OneOrMany::many(vec![
-                ToolResultContent::text(description),
-                ToolResultContent::image_base64(img_result.data, media_type, None),
-            ]) {
-                Ok(content) => return content,
-                Err(_) => {} // Fall through to text-only
-            }
-        }
-    }
-
-    // Default: treat as plain text
-    OneOrMany::one(ToolResultContent::text(tool_result))
-}
 
 #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
 pub type StreamingResult<R> =
@@ -432,9 +372,7 @@ where
 
                             match tc_result {
                                 Ok(text) => {
-                                    // Parse tool result for multimodal content (e.g., images)
-                                    let content = parse_tool_result_content(&text);
-                                    let tr = ToolResult { id: tool_call.id, call_id: tool_call.call_id, content };
+                                    let tr = ToolResult { id: tool_call.id, call_id: tool_call.call_id, content: OneOrMany::one(ToolResultContent::Text(Text { text })) };
                                     yield Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult(tr)));
                                 }
                                 Err(e) => {
@@ -493,21 +431,19 @@ where
 
                 // Add tool results to chat history
                 for (id, call_id, tool_result) in tool_results {
-                    // Parse tool result for multimodal content (e.g., images)
-                    let content = parse_tool_result_content(&tool_result);
                     if let Some(call_id) = call_id {
                         chat_history.write().await.push(Message::User {
                             content: OneOrMany::one(UserContent::tool_result_with_call_id(
                                 &id,
                                 call_id.clone(),
-                                content,
+                                OneOrMany::one(ToolResultContent::text(&tool_result)),
                             )),
                         });
                     } else {
                         chat_history.write().await.push(Message::User {
                             content: OneOrMany::one(UserContent::tool_result(
                                 &id,
-                                content,
+                                OneOrMany::one(ToolResultContent::text(&tool_result)),
                             )),
                         });
                     }
